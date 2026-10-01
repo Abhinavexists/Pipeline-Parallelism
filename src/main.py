@@ -1,3 +1,4 @@
+import argparse
 import time
 import torch
 import torch.optim as optim
@@ -15,8 +16,23 @@ from communication import init_distributed, PipelineCommunication
 from schedule import (
     naive_pipeline_step,
     gpipe_pipeline_step,
-    onef_oneb_pipeline_step
+    onef_oneb_pipeline_step,
+    microbatch_sizes,
 )
+
+parser = argparse.ArgumentParser(description="Train a sharded MLP with pipeline parallelism")
+parser.add_argument("--schedule", choices=("naive", "gpipe", "1f1b"), default="1f1b")
+parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+parser.add_argument("--chunks", type=int, default=CHUNKS)
+parser.add_argument("--steps", type=int, default=STEPS)
+args = parser.parse_args()
+if args.batch_size < 1 or args.steps < 1:
+    parser.error("batch size and steps must be positive")
+if args.schedule != "naive":
+    try:
+        microbatch_sizes(args.batch_size, args.chunks)
+    except ValueError as error:
+        parser.error(str(error))
 
 # 1. Distributed Environment
 rank, world_size, device = init_distributed()
@@ -62,15 +78,15 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # 4. Only Rank 0 loads the data.
 if rank == 0:
-    fixed_input = torch.randn(BATCH_SIZE, HIDDEN_DIM).to(device)
+    fixed_input = torch.randn(args.batch_size, HIDDEN_DIM).to(device)
 else:
-    fixed_input = BATCH_SIZE
+    fixed_input = args.batch_size
 
 # 5. Only the Last Rank needs the targets to calc loss.
 if rank == world_size - 1:
     # We want the model to learn to classify 
     # these random vectors into class '0' or '1'
-    fixed_target = torch.randint(0, 2, (BATCH_SIZE,)).to(device)
+    fixed_target = torch.randint(0, 2, (args.batch_size,)).to(device)
 else:
     fixed_target = torch.empty(0).to(device)
 
@@ -79,35 +95,21 @@ model.train()
 loss = None
 start_time = time.time()
 
-for step in range(STEPS):
+for step in range(args.steps):
     profiler.start_stage("step")
     optimizer.zero_grad()
-    if rank == world_size - 1:
-        loss = onef_oneb_pipeline_step(
-            model,
-            communication,
-            fixed_input,
-            fixed_target,
-            HIDDEN_DIM,
-            CHUNKS,
-            device,
-            profiler
-        )
+    if args.schedule == "naive":
+        loss = naive_pipeline_step(model, communication, fixed_input, fixed_target,
+                                   HIDDEN_DIM, device, profiler)
     else:
-        onef_oneb_pipeline_step(
-            model,
-            communication,
-            fixed_input,
-            fixed_target,
-            HIDDEN_DIM,
-            CHUNKS,
-            device,
-            profiler
-        )
+        pipeline_step = (gpipe_pipeline_step if args.schedule == "gpipe"
+                         else onef_oneb_pipeline_step)
+        loss = pipeline_step(model, communication, fixed_input, fixed_target,
+                             HIDDEN_DIM, args.chunks, device, profiler)
     optimizer.step()
     profiler.end_stage("step")
     if rank == world_size - 1 and step % 5 == 0 and loss is not None:
-        print(f"Step {step:02d} | Loss: {loss.item()/CHUNKS:.6f}")
+        print(f"Step {step:02d} | Loss: {loss.item():.6f}")
 
 # Clean up
 duration = time.time() - start_time
@@ -115,7 +117,7 @@ if rank == 0:
     print("--- Training Complete ---")
     print(f"Time: {duration:.3f}s")
 if rank == world_size - 1 and loss is not None:
-    print(f"Final Loss: {loss.item()/CHUNKS:.6f}")
+    print(f"Final Loss: {loss.item():.6f}")
 profiler.print_summary()
 torch.distributed.destroy_process_group()
 

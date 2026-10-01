@@ -7,6 +7,14 @@ from profiler import PipelineProfiler
 from typing import Union, Optional
 
 
+def microbatch_sizes(batch_size: int, chunks: int) -> list[int]:
+    """Split a batch into nonempty, nearly equal microbatches."""
+    if not 1 <= chunks <= batch_size:
+        raise ValueError("chunks must be between 1 and batch size")
+    size, extra = divmod(batch_size, chunks)
+    return [size + (index < extra) for index in range(chunks)]
+
+
 def naive_pipeline_step(
     model: ShardedMLP,
     communication: PipelineCommunication,
@@ -118,29 +126,20 @@ def gpipe_pipeline_step(
     GPipe Schedule: FWD all chunks -> BWD all chunks.
     """
 
-    micro_batches = None
-    micro_targets = None
-
-    if model.rank == 0 and isinstance(batch, torch.Tensor):
-        micro_batches = torch.chunk(batch, chunks)
-        micro_targets = torch.chunk(targets, chunks)
-    
-    if model.rank == model.world_size - 1 and isinstance(targets, torch.Tensor):
-        micro_targets = torch.chunk(targets, chunks)
+    batch_size = batch if isinstance(batch, int) else batch.shape[0]
+    sizes = microbatch_sizes(batch_size, chunks)
+    micro_batches = torch.split(batch, sizes) if model.rank == 0 else None
+    micro_targets = torch.split(targets, sizes) if model.rank == model.world_size - 1 else None
 
     input_buffer = []
     output_buffer = []
 
     for i in range(chunks):
-        if model.rank == 0 and micro_batches is not None and micro_targets is not None:
+        if model.rank == 0 and micro_batches is not None:
             input_data = micro_batches[i]
-            current_target = micro_targets[i]
+            current_target = None
         else:
-            if isinstance(batch, int):
-                batch_size = batch // chunks
-            else:
-                batch_size = batch.shape[0] // chunks
-            shape = (batch_size, hidden_dim)
+            shape = (sizes[i], hidden_dim)
             if profiler:
                 with profiler.time_block("recv_forward"):
                     input_data = communication.recv_forward(shape, device)
@@ -172,19 +171,18 @@ def gpipe_pipeline_step(
         input_data = input_buffer[i]
         
         if model.rank == model.world_size - 1:
-            # Accumulate loss from all chunks
+            # CrossEntropyLoss returns a mean for each microbatch.
+            scaled_loss = output * (sizes[i] / batch_size)
             if loss is None:
-                loss = output
+                loss = scaled_loss.detach()
             else:
-                loss = loss + output
+                loss = loss + scaled_loss.detach()
             
-            # Use retain_graph for all but the last (first in reverse) iteration
-            retain = (i > 0)
             if profiler:
                 with profiler.time_block("compute_backward"):
-                    output.backward(retain_graph=retain)
+                    scaled_loss.backward()
             else:
-                output.backward(retain_graph=retain)
+                scaled_loss.backward()
         else:
             if profiler:
                 with profiler.time_block("recv_backward"):
@@ -221,31 +219,23 @@ def onef_oneb_pipeline_step(
     1F1B Schedule: Interleaves Forward and Backward passes in a pipelined manner.
     """
     
-    micro_batches = None
-    micro_targets = None
-    
-    if model.rank == 0 and isinstance(batch, torch.Tensor):
-        micro_batches = torch.chunk(batch, chunks)
-    
-    if model.rank == model.world_size - 1 and isinstance(targets, torch.Tensor):
-        micro_targets = torch.chunk(targets, chunks)
+    batch_size = batch if isinstance(batch, int) else batch.shape[0]
+    sizes = microbatch_sizes(batch_size, chunks)
+    micro_batches = torch.split(batch, sizes) if model.rank == 0 else None
+    micro_targets = torch.split(targets, sizes) if model.rank == model.world_size - 1 else None
 
     input_buffer: list[Optional[torch.Tensor]] = [None] * chunks
     output_buffer: list[Optional[torch.Tensor]] = [None] * chunks
     async_requests = []
 
-    num_warmup = model.world_size - model.rank - 1
+    num_warmup = min(model.world_size - model.rank - 1, chunks)
     num_1f1b = chunks - num_warmup
 
     def run_forward(micro_batch_idx):
         if model.rank == 0 and micro_batches is not None:
             input_data = micro_batches[micro_batch_idx]
         else:
-            if isinstance(batch, int):
-                batch_size = batch // chunks
-            else:
-                batch_size = batch.shape[0] // chunks
-            shape = (batch_size, hidden_dim)
+            shape = (sizes[micro_batch_idx], hidden_dim)
             if profiler:
                 with profiler.time_block("recv_forward"):
                     input_data = communication.recv_forward(shape, device)
@@ -282,12 +272,12 @@ def onef_oneb_pipeline_step(
         output = output_buffer[micro_batch_idx]
 
         if model.rank == model.world_size - 1:
-            loss = output
+            loss = output * (sizes[micro_batch_idx] / batch_size)
             if profiler:
                 with profiler.time_block("compute_backward"):
-                    loss.backward(retain_graph=True)
+                    loss.backward()
             else:
-                loss.backward(retain_graph=True)
+                loss.backward()
         else:
             if profiler:
                 with profiler.time_block("recv_backward"):
@@ -307,7 +297,7 @@ def onef_oneb_pipeline_step(
                     communication.send_backward(input_data.grad)
 
         if model.rank == model.world_size - 1:
-            return loss
+            return loss.detach()
 
     loss = None
     if model.rank == model.world_size - 1:

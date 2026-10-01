@@ -28,6 +28,18 @@ Run with 4 pipeline stages:
 uv run torchrun --nproc-per-node 4 src/main.py
 ```
 
+Select a schedule with `--schedule naive`, `--schedule gpipe`, or
+`--schedule 1f1b` (the default). For example:
+
+```bash
+uv run torchrun --nproc-per-node 4 src/main.py --schedule gpipe
+```
+
+For GPipe and 1F1B, `CHUNKS` must be between 1 and `BATCH_SIZE`.
+Uneven batches are split into nearly equal microbatches.
+Use `--batch-size`, `--chunks`, and `--steps` to override the corresponding
+settings for a run.
+
 ## Configuration
 
 Edit `src/config/config.py` to adjust:
@@ -86,7 +98,7 @@ Results are printed after training for each rank.
 
 ## License
 
-See [LICENSE](README.md) file for details.
+See [LICENSE](LICENSE) file for details.
 
 ## Credits
 
